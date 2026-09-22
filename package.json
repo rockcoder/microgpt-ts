@@ -1,0 +1,16 @@
+{
+  "name": "microgpt-ts",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx src/microgpt.ts",
+    "start": "tsx src/microgpt.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "~26.6.2",
+    "tsx": "~4.23.15",
+    "typescript": "~7.0.2"
+  }
+}
