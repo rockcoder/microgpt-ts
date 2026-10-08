@@ -5,14 +5,13 @@
 //   tokenizer -> scalar autograd -> Transformer -> Adam -> inference
 //
 // Run with:
-//   npx tsx microgpt.ts
+//   npm start            (or: npx tsx src/microgpt.ts)
 //
-// Put a names.txt/input.txt file next to this script if you don't
-// want to download the dataset yourself.
+// Expects an input.txt next to package.json (one document per line).
 // Shorter/longer runs: MICROGPT_STEPS=100 npm start
 
-import { readFileSync, existsSync } from "node:fs";
-import { pathToFileURL } from "node:url";
+import { existsSync, readFileSync } from "node:fs";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 // -----------------------------------------------------------------------------
 // Randomness
@@ -443,6 +442,29 @@ function gpt(
 }
 
 // -----------------------------------------------------------------------------
+// Dataset
+// -----------------------------------------------------------------------------
+
+// input.txt is looked up in the current directory first (matching microgpt.py),
+// then next to package.json so `npm start` works from anywhere.
+function resolveInputPath(): string {
+  const candidates = [
+    "input.txt",
+    fileURLToPath(new URL("../input.txt", import.meta.url)),
+  ];
+
+  for (const candidate of candidates) {
+    if (existsSync(candidate)) return candidate;
+  }
+
+  throw new Error(
+    "input.txt not found. Get the names dataset from\n" +
+      "  https://raw.githubusercontent.com/karpathy/makemore/988aa59/names.txt\n" +
+      "and place it next to package.json (or in the current directory)."
+  );
+}
+
+// -----------------------------------------------------------------------------
 // Training and inference
 // -----------------------------------------------------------------------------
 
@@ -451,18 +473,10 @@ function main(): void {
   // Dataset
   // -------------------------------------------------------------------------
 
-  let docs: string[];
-
-  if (existsSync("input.txt")) {
-    docs = readFileSync("input.txt", "utf8")
-      .split(/\r?\n/)
-      .map((x) => x.trim())
-      .filter(Boolean);
-  } else {
-    throw new Error(
-      "input.txt not found. Download the names dataset and put it next to microgpt.ts."
-    );
-  }
+  const docs = readFileSync(resolveInputPath(), "utf8")
+    .split(/\r?\n/)
+    .map((x) => x.trim())
+    .filter(Boolean);
 
   rng.shuffle(docs);
 
@@ -632,13 +646,21 @@ function main(): void {
       p.grad = 0;
     }
 
-    process.stdout.write(
-      `step ${(step + 1)
-        .toString()
-        .padStart(4)} / ${numSteps
-        .toString()
-        .padStart(4)} | loss ${loss.data.toFixed(4)}\r`
-    );
+    const progress = `step ${(step + 1)
+      .toString()
+      .padStart(4)} / ${numSteps
+      .toString()
+      .padStart(4)} | loss ${loss.data.toFixed(4)}`;
+
+    if (process.stdout.isTTY) {
+      process.stdout.write(progress + "\r");
+    } else {
+      console.log(progress);
+    }
+  }
+
+  if (process.stdout.isTTY) {
+    process.stdout.write("\n");
   }
 
   // -------------------------------------------------------------------------
@@ -647,9 +669,7 @@ function main(): void {
 
   const temperature = 0.5;
 
-  console.log(
-    "\n--- inference (new, hallucinated names) ---"
-  );
+  console.log("--- inference (new, hallucinated names) ---");
 
   for (
     let sampleIdx = 0;
