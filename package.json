@@ -8,7 +8,8 @@
     "start": "tsx src/microgpt.ts",
     "dev:mod": "tsx src/microgpt/main.ts",
     "start:mod": "tsx src/microgpt/main.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "tsx test/gradcheck.ts"
   },
   "devDependencies": {
     "@types/node": "~26.6.2",

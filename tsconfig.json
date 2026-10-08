@@ -6,9 +6,11 @@
         "strict": true,
         "noEmit": true,
         "skipLibCheck": true,
+        "allowImportingTsExtensions": true,
         "types": ["node"]
     },
     "include": [
-        "src/**/*"
+        "src/**/*",
+        "test/**/*"
     ]
 }
