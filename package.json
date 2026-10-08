@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "tsx src/microgpt.ts",
     "start": "tsx src/microgpt.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "tsx test/gradcheck.ts"
   },
   "devDependencies": {
     "@types/node": "~26.6.2",
