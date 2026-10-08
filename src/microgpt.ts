@@ -5,12 +5,13 @@
 //   tokenizer -> scalar autograd -> Transformer -> Adam -> inference
 //
 // Run with:
-//   npx tsx microgpt.ts
+//   npm start            (or: npx tsx src/microgpt.ts)
 //
-// Put a names.txt/input.txt file next to this script if you don't
-// want to download the dataset yourself.
+// Expects an input.txt next to package.json (one document per line).
+// Shorter/longer runs: MICROGPT_STEPS=100 npm start
 
-import { readFileSync, existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 // -----------------------------------------------------------------------------
 // Randomness
@@ -52,6 +53,13 @@ class RNG {
 
   choiceWeighted(weights: number[]): number {
     const total = weights.reduce((a, b) => a + b, 0);
+
+    if (!Number.isFinite(total)) {
+      throw new Error(
+        `choiceWeighted: weights must sum to a finite number, got ${total}`
+      );
+    }
+
     let r = this.random() * total;
 
     for (let i = 0; i < weights.length; i++) {
@@ -73,45 +81,47 @@ class RNG {
 const rng = new RNG(42);
 
 // -----------------------------------------------------------------------------
-// Dataset
+// Configuration
 // -----------------------------------------------------------------------------
 
-let docs: string[];
+// Read a positive integer from the environment, e.g. MICROGPT_STEPS=100.
+function envInt(name: string, fallback: number): number {
+  const raw = process.env[name];
 
-if (existsSync("input.txt")) {
-  docs = readFileSync("input.txt", "utf8")
-    .split(/\r?\n/)
-    .map((x) => x.trim())
-    .filter(Boolean);
-} else {
-  throw new Error(
-    "input.txt not found. Download the names dataset and put it next to microgpt.ts."
-  );
+  if (raw === undefined) return fallback;
+
+  const value = Number(raw);
+
+  if (!Number.isInteger(value) || value <= 0) {
+    throw new Error(
+      `${name} must be a positive integer, got "${raw}"`
+    );
+  }
+
+  return value;
 }
 
-rng.shuffle(docs);
+const nLayer = 1;
+const nEmbd = 16;
+const blockSize = 16;
+const nHead = 4;
+const headDim = nEmbd / nHead;
 
-console.log(`num docs: ${docs.length}`);
+if (!Number.isInteger(headDim)) {
+  throw new Error("nEmbd must be divisible by nHead");
+}
 
-// -----------------------------------------------------------------------------
-// Tokenizer
-// -----------------------------------------------------------------------------
-
-const uchars = [...new Set(docs.join(""))].sort();
-const BOS = uchars.length;
-const vocabSize = uchars.length + 1;
-
-console.log(`vocab size: ${vocabSize}`);
-
-const charToToken = new Map<string, number>(
-  uchars.map((ch, i) => [ch, i])
-);
+const numSteps = envInt("MICROGPT_STEPS", 1000);
+const learningRate = 0.01;
+const beta1 = 0.85;
+const beta2 = 0.99;
+const epsAdam = 1e-8;
 
 // -----------------------------------------------------------------------------
 // Scalar autograd
 // -----------------------------------------------------------------------------
 
-class Value {
+export class Value {
   data: number;
   grad: number;
 
@@ -233,25 +243,26 @@ class Value {
 }
 
 // -----------------------------------------------------------------------------
-// Model configuration
-// -----------------------------------------------------------------------------
-
-const nLayer = 1;
-const nEmbd = 16;
-const blockSize = 16;
-const nHead = 4;
-const headDim = nEmbd / nHead;
-
-if (!Number.isInteger(headDim)) {
-  throw new Error("nEmbd must be divisible by nHead");
-}
-
-// -----------------------------------------------------------------------------
 // Parameter initialization
 // -----------------------------------------------------------------------------
 
 type Matrix = Value[][];
 type StateDict = Record<string, Matrix>;
+
+// Populated by main(); gpt() reads it.
+let stateDict: StateDict;
+
+// Fetch a parameter matrix by name. Fails loudly on a typo instead of
+// returning undefined and crashing later inside a .map().
+function param(key: string): Matrix {
+  const mat = stateDict[key];
+
+  if (!mat) {
+    throw new Error(`unknown parameter "${key}"`);
+  }
+
+  return mat;
+}
 
 function matrix(
   nout: number,
@@ -268,51 +279,11 @@ function matrix(
   );
 }
 
-const stateDict: StateDict = {
-  wte: matrix(vocabSize, nEmbd),
-  wpe: matrix(blockSize, nEmbd),
-  lm_head: matrix(vocabSize, nEmbd),
-};
-
-for (let i = 0; i < nLayer; i++) {
-  stateDict[`layer${i}.attn_wq`] =
-    matrix(nEmbd, nEmbd);
-
-  stateDict[`layer${i}.attn_wk`] =
-    matrix(nEmbd, nEmbd);
-
-  stateDict[`layer${i}.attn_wv`] =
-    matrix(nEmbd, nEmbd);
-
-  stateDict[`layer${i}.attn_wo`] =
-    matrix(nEmbd, nEmbd);
-
-  stateDict[`layer${i}.mlp_fc1`] =
-    matrix(4 * nEmbd, nEmbd);
-
-  stateDict[`layer${i}.mlp_fc2`] =
-    matrix(nEmbd, 4 * nEmbd);
-}
-
-// Flatten parameters.
-
-const params: Value[] = [];
-
-for (const mat of Object.values(stateDict)) {
-  for (const row of mat) {
-    for (const p of row) {
-      params.push(p);
-    }
-  }
-}
-
-console.log(`num params: ${params.length}`);
-
 // -----------------------------------------------------------------------------
 // Math helpers
 // -----------------------------------------------------------------------------
 
-function sumValues(xs: Value[]): Value {
+export function sumValues(xs: Value[]): Value {
   if (xs.length === 0) {
     return new Value(0);
   }
@@ -323,7 +294,7 @@ function sumValues(xs: Value[]): Value {
   );
 }
 
-function linear(x: Value[], w: Matrix): Value[] {
+export function linear(x: Value[], w: Matrix): Value[] {
   return w.map((row) => {
     const terms = row.map((wi, i) =>
       wi.mul(x[i])
@@ -333,7 +304,7 @@ function linear(x: Value[], w: Matrix): Value[] {
   });
 }
 
-function softmax(logits: Value[]): Value[] {
+export function softmax(logits: Value[]): Value[] {
   const maxVal = Math.max(
     ...logits.map((x) => x.data)
   );
@@ -347,7 +318,7 @@ function softmax(logits: Value[]): Value[] {
   return exps.map((e) => e.div(total));
 }
 
-function rmsnorm(x: Value[]): Value[] {
+export function rmsnorm(x: Value[]): Value[] {
   const ms = sumValues(
     x.map((xi) => xi.mul(xi))
   ).div(x.length);
@@ -372,8 +343,8 @@ function gpt(
   keys: KVCache,
   values: KVCache
 ): Value[] {
-  const tokEmb = stateDict.wte[tokenId];
-  const posEmb = stateDict.wpe[posId];
+  const tokEmb = param("wte")[tokenId];
+  const posEmb = param("wpe")[posId];
 
   let x = tokEmb.map((t, i) =>
     t.add(posEmb[i])
@@ -392,21 +363,19 @@ function gpt(
 
     const q = linear(
       x,
-      stateDict[`layer${li}.attn_wq`]
+      param(`layer${li}.attn_wq`)
     );
 
     const k = linear(
       x,
-      stateDict[`layer${li}.attn_wk`]
+      param(`layer${li}.attn_wk`)
     );
 
     const v = linear(
       x,
-      stateDict[`layer${li}.attn_wv`]
+      param(`layer${li}.attn_wv`)
     );
 
-    // keys[li].push(k as unknown as Value);
-    // values[li].push(v as unknown as Value);
     keys[li].push(k);
     values[li].push(v);
 
@@ -453,7 +422,7 @@ function gpt(
 
     x = linear(
       xAttn,
-      stateDict[`layer${li}.attn_wo`]
+      param(`layer${li}.attn_wo`)
     );
 
     x = x.map((a, i) =>
@@ -470,14 +439,14 @@ function gpt(
 
     x = linear(
       x,
-      stateDict[`layer${li}.mlp_fc1`]
+      param(`layer${li}.mlp_fc1`)
     );
 
     x = x.map((xi) => xi.relu());
 
     x = linear(
       x,
-      stateDict[`layer${li}.mlp_fc2`]
+      param(`layer${li}.mlp_fc2`)
     );
 
     x = x.map((a, i) =>
@@ -487,188 +456,307 @@ function gpt(
 
   return linear(
     x,
-    stateDict.lm_head
+    param("lm_head")
   );
 }
 
 // -----------------------------------------------------------------------------
-// Adam
+// Dataset
 // -----------------------------------------------------------------------------
 
-const learningRate = 0.01;
-const beta1 = 0.85;
-const beta2 = 0.99;
-const epsAdam = 1e-8;
-
-const m = new Array<number>(
-  params.length
-).fill(0);
-
-const v = new Array<number>(
-  params.length
-).fill(0);
-
-// -----------------------------------------------------------------------------
-// Training
-// -----------------------------------------------------------------------------
-
-const numSteps = 100; //1000;
-
-for (let step = 0; step < numSteps; step++) {
-  const doc = docs[step % docs.length];
-
-  const tokens = [
-    BOS,
-    ...[...doc].map((ch) => {
-      const token = charToToken.get(ch);
-
-      if (token === undefined) {
-        throw new Error(`Unknown character: ${ch}`);
-      }
-
-      return token;
-    }),
-    BOS,
+// input.txt is looked up in the current directory first (matching microgpt.py),
+// then next to package.json so `npm start` works from anywhere.
+function resolveInputPath(): string {
+  const candidates = [
+    "input.txt",
+    fileURLToPath(new URL("../input.txt", import.meta.url)),
   ];
 
-  const n = Math.min(
-    blockSize,
-    tokens.length - 1
+  for (const candidate of candidates) {
+    if (existsSync(candidate)) return candidate;
+  }
+
+  throw new Error(
+    "input.txt not found. Get the names dataset from\n" +
+      "  https://raw.githubusercontent.com/karpathy/makemore/988aa59/names.txt\n" +
+      "and place it next to package.json (or in the current directory)."
+  );
+}
+
+// -----------------------------------------------------------------------------
+// Training and inference
+// -----------------------------------------------------------------------------
+
+function main(): void {
+  // -------------------------------------------------------------------------
+  // Dataset
+  // -------------------------------------------------------------------------
+
+  const docs = readFileSync(resolveInputPath(), "utf8")
+    .split(/\r?\n/)
+    .map((x) => x.trim())
+    .filter(Boolean);
+
+  rng.shuffle(docs);
+
+  console.log(`num docs: ${docs.length}`);
+
+  // -------------------------------------------------------------------------
+  // Tokenizer
+  // -------------------------------------------------------------------------
+
+  const uchars = [...new Set(docs.join(""))].sort();
+  const BOS = uchars.length;
+  const vocabSize = uchars.length + 1;
+
+  console.log(`vocab size: ${vocabSize}`);
+
+  const charToToken = new Map<string, number>(
+    uchars.map((ch, i) => [ch, i])
   );
 
-  const keys: KVCache = Array.from(
-    { length: nLayer },
-    () => []
-  );
+  // -------------------------------------------------------------------------
+  // Parameter initialization
+  // -------------------------------------------------------------------------
 
-  const values: KVCache = Array.from(
-    { length: nLayer },
-    () => []
-  );
+  stateDict = {
+    wte: matrix(vocabSize, nEmbd),
+    wpe: matrix(blockSize, nEmbd),
+    lm_head: matrix(vocabSize, nEmbd),
+  };
 
-  const losses: Value[] = [];
+  for (let i = 0; i < nLayer; i++) {
+    stateDict[`layer${i}.attn_wq`] =
+      matrix(nEmbd, nEmbd);
 
-  for (let posId = 0; posId < n; posId++) {
-    const tokenId = tokens[posId];
-    const targetId = tokens[posId + 1];
+    stateDict[`layer${i}.attn_wk`] =
+      matrix(nEmbd, nEmbd);
 
-    const logits = gpt(
-      tokenId,
-      posId,
-      keys,
-      values
+    stateDict[`layer${i}.attn_wv`] =
+      matrix(nEmbd, nEmbd);
+
+    stateDict[`layer${i}.attn_wo`] =
+      matrix(nEmbd, nEmbd);
+
+    stateDict[`layer${i}.mlp_fc1`] =
+      matrix(4 * nEmbd, nEmbd);
+
+    stateDict[`layer${i}.mlp_fc2`] =
+      matrix(nEmbd, 4 * nEmbd);
+  }
+
+  // Flatten parameters.
+
+  const params: Value[] = [];
+
+  for (const mat of Object.values(stateDict)) {
+    for (const row of mat) {
+      for (const p of row) {
+        params.push(p);
+      }
+    }
+  }
+
+  console.log(`num params: ${params.length}`);
+
+  // -------------------------------------------------------------------------
+  // Adam buffers
+  // -------------------------------------------------------------------------
+
+  const m = new Array<number>(
+    params.length
+  ).fill(0);
+
+  const v = new Array<number>(
+    params.length
+  ).fill(0);
+
+  // -------------------------------------------------------------------------
+  // Training
+  // -------------------------------------------------------------------------
+
+  for (let step = 0; step < numSteps; step++) {
+    const doc = docs[step % docs.length];
+
+    const tokens = [
+      BOS,
+      ...[...doc].map((ch) => {
+        const token = charToToken.get(ch);
+
+        if (token === undefined) {
+          throw new Error(`Unknown character: ${ch}`);
+        }
+
+        return token;
+      }),
+      BOS,
+    ];
+
+    const n = Math.min(
+      blockSize,
+      tokens.length - 1
     );
 
-    const probs = softmax(logits);
+    const keys: KVCache = Array.from(
+      { length: nLayer },
+      () => []
+    );
 
-    const lossT = probs[targetId].log().neg();
+    const values: KVCache = Array.from(
+      { length: nLayer },
+      () => []
+    );
 
-    losses.push(lossT);
-  }
+    const losses: Value[] = [];
 
-  const loss = sumValues(losses).div(n);
+    for (let posId = 0; posId < n; posId++) {
+      const tokenId = tokens[posId];
+      const targetId = tokens[posId + 1];
 
-  // Backprop.
-  loss.backward();
+      const logits = gpt(
+        tokenId,
+        posId,
+        keys,
+        values
+      );
 
-  // Adam.
-  const lrT =
-    learningRate *
-    (1 - step / numSteps);
+      const probs = softmax(logits);
 
-  for (let i = 0; i < params.length; i++) {
-    const p = params[i];
+      const lossT = probs[targetId].log().neg();
 
-    m[i] =
-      beta1 * m[i] +
-      (1 - beta1) * p.grad;
+      losses.push(lossT);
+    }
 
-    v[i] =
-      beta2 * v[i] +
-      (1 - beta2) * p.grad ** 2;
+    const loss = sumValues(losses).div(n);
 
-    const mHat =
-      m[i] /
-      (1 - beta1 ** (step + 1));
+    if (!Number.isFinite(loss.data)) {
+      throw new Error(
+        `step ${step + 1}: loss is not finite (${loss.data}), ` +
+          "aborting before the update corrupts the weights"
+      );
+    }
 
-    const vHat =
-      v[i] /
-      (1 - beta2 ** (step + 1));
+    // Backprop.
+    loss.backward();
 
-    p.data -=
-      lrT *
-      mHat /
-      (Math.sqrt(vHat) + epsAdam);
+    // Adam.
+    const lrT =
+      learningRate *
+      (1 - step / numSteps);
 
-    // Reset gradient for next iteration.
-    p.grad = 0;
-  }
+    for (let i = 0; i < params.length; i++) {
+      const p = params[i];
 
-  process.stdout.write(
-    `step ${(step + 1)
+      m[i] =
+        beta1 * m[i] +
+        (1 - beta1) * p.grad;
+
+      v[i] =
+        beta2 * v[i] +
+        (1 - beta2) * p.grad ** 2;
+
+      const mHat =
+        m[i] /
+        (1 - beta1 ** (step + 1));
+
+      const vHat =
+        v[i] /
+        (1 - beta2 ** (step + 1));
+
+      p.data -=
+        lrT *
+        mHat /
+        (Math.sqrt(vHat) + epsAdam);
+
+      // Reset gradient for next iteration.
+      p.grad = 0;
+    }
+
+    const progress = `step ${(step + 1)
       .toString()
       .padStart(4)} / ${numSteps
       .toString()
-      .padStart(4)} | loss ${loss.data.toFixed(4)}\r`
-  );
+      .padStart(4)} | loss ${loss.data.toFixed(4)}`;
+
+    if (process.stdout.isTTY) {
+      process.stdout.write(progress + "\r");
+    } else {
+      console.log(progress);
+    }
+  }
+
+  if (process.stdout.isTTY) {
+    process.stdout.write("\n");
+  }
+
+  // -------------------------------------------------------------------------
+  // Inference
+  // -------------------------------------------------------------------------
+
+  const temperature = 0.5;
+
+  console.log("--- inference (new, hallucinated names) ---");
+
+  for (
+    let sampleIdx = 0;
+    sampleIdx < 20;
+    sampleIdx++
+  ) {
+    const keys: KVCache = Array.from(
+      { length: nLayer },
+      () => []
+    );
+
+    const values: KVCache = Array.from(
+      { length: nLayer },
+      () => []
+    );
+
+    let tokenId = BOS;
+    const sample: string[] = [];
+
+    for (
+      let posId = 0;
+      posId < blockSize;
+      posId++
+    ) {
+      const logits = gpt(
+        tokenId,
+        posId,
+        keys,
+        values
+      );
+
+      const probs = softmax(
+        logits.map((l) =>
+          l.div(temperature)
+        )
+      );
+
+      tokenId = rng.choiceWeighted(
+        probs.map((p) => p.data)
+      );
+
+      if (tokenId === BOS) {
+        break;
+      }
+
+      sample.push(uchars[tokenId]);
+    }
+
+    console.log(
+      `sample ${(sampleIdx + 1)
+        .toString()
+        .padStart(2)}: ${sample.join("")}`
+    );
+  }
 }
 
 // -----------------------------------------------------------------------------
-// Inference
-// -----------------------------------------------------------------------------
 
-const temperature = 0.5;
-
-console.log(
-  "\n--- inference (new, hallucinated names) ---"
-);
-
-for (let sampleIdx = 0; sampleIdx < 20; sampleIdx++) {
-  const keys: KVCache = Array.from(
-    { length: nLayer },
-    () => []
-  );
-
-  const values: KVCache = Array.from(
-    { length: nLayer },
-    () => []
-  );
-
-  let tokenId = BOS;
-  const sample: string[] = [];
-
-  for (
-    let posId = 0;
-    posId < blockSize;
-    posId++
-  ) {
-    const logits = gpt(
-      tokenId,
-      posId,
-      keys,
-      values
-    );
-
-    const probs = softmax(
-      logits.map((l) =>
-        l.div(temperature)
-      )
-    );
-
-    tokenId = rng.choiceWeighted(
-      probs.map((p) => p.data)
-    );
-
-    if (tokenId === BOS) {
-      break;
-    }
-
-    sample.push(uchars[tokenId]);
-  }
-
-  console.log(
-    `sample ${(sampleIdx + 1)
-      .toString()
-      .padStart(2)}: ${sample.join("")}`
-  );
+if (
+  process.argv[1] &&
+  import.meta.url === pathToFileURL(process.argv[1]).href
+) {
+  main();
 }
