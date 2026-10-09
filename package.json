@@ -6,6 +6,8 @@
   "scripts": {
     "dev": "tsx src/microgpt.ts",
     "start": "tsx src/microgpt.ts",
+    "dev:mod": "tsx src/microgpt/main.ts",
+    "start:mod": "tsx src/microgpt/main.ts",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
