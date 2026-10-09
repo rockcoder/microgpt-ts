@@ -9,6 +9,7 @@
 //
 // Put a names.txt/input.txt file next to this script if you don't
 // want to download the dataset yourself.
+// Shorter/longer runs: MICROGPT_STEPS=100 npm start
 
 import { readFileSync, existsSync } from "node:fs";
 
@@ -512,7 +513,24 @@ const v = new Array<number>(
 // Training
 // -----------------------------------------------------------------------------
 
-const numSteps = 100; //1000;
+// Read a positive integer from the environment, e.g. MICROGPT_STEPS=100.
+function envInt(name: string, fallback: number): number {
+  const raw = process.env[name];
+
+  if (raw === undefined) return fallback;
+
+  const value = Number(raw);
+
+  if (!Number.isInteger(value) || value <= 0) {
+    throw new Error(
+      `${name} must be a positive integer, got "${raw}"`
+    );
+  }
+
+  return value;
+}
+
+const numSteps = envInt("MICROGPT_STEPS", 1000); // number of training steps
 
 for (let step = 0; step < numSteps; step++) {
   const doc = docs[step % docs.length];
