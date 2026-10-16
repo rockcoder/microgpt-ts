@@ -12,6 +12,7 @@
 // Shorter/longer runs: MICROGPT_STEPS=100 npm start
 
 import { readFileSync, existsSync } from "node:fs";
+import { pathToFileURL } from "node:url";
 
 // -----------------------------------------------------------------------------
 // Randomness
@@ -74,45 +75,47 @@ class RNG {
 const rng = new RNG(42);
 
 // -----------------------------------------------------------------------------
-// Dataset
+// Configuration
 // -----------------------------------------------------------------------------
 
-let docs: string[];
+// Read a positive integer from the environment, e.g. MICROGPT_STEPS=100.
+function envInt(name: string, fallback: number): number {
+  const raw = process.env[name];
 
-if (existsSync("input.txt")) {
-  docs = readFileSync("input.txt", "utf8")
-    .split(/\r?\n/)
-    .map((x) => x.trim())
-    .filter(Boolean);
-} else {
-  throw new Error(
-    "input.txt not found. Download the names dataset and put it next to microgpt.ts."
-  );
+  if (raw === undefined) return fallback;
+
+  const value = Number(raw);
+
+  if (!Number.isInteger(value) || value <= 0) {
+    throw new Error(
+      `${name} must be a positive integer, got "${raw}"`
+    );
+  }
+
+  return value;
 }
 
-rng.shuffle(docs);
+const nLayer = 1;
+const nEmbd = 16;
+const blockSize = 16;
+const nHead = 4;
+const headDim = nEmbd / nHead;
 
-console.log(`num docs: ${docs.length}`);
+if (!Number.isInteger(headDim)) {
+  throw new Error("nEmbd must be divisible by nHead");
+}
 
-// -----------------------------------------------------------------------------
-// Tokenizer
-// -----------------------------------------------------------------------------
-
-const uchars = [...new Set(docs.join(""))].sort();
-const BOS = uchars.length;
-const vocabSize = uchars.length + 1;
-
-console.log(`vocab size: ${vocabSize}`);
-
-const charToToken = new Map<string, number>(
-  uchars.map((ch, i) => [ch, i])
-);
+const numSteps = envInt("MICROGPT_STEPS", 1000);
+const learningRate = 0.01;
+const beta1 = 0.85;
+const beta2 = 0.99;
+const epsAdam = 1e-8;
 
 // -----------------------------------------------------------------------------
 // Scalar autograd
 // -----------------------------------------------------------------------------
 
-class Value {
+export class Value {
   data: number;
   grad: number;
 
@@ -234,25 +237,14 @@ class Value {
 }
 
 // -----------------------------------------------------------------------------
-// Model configuration
-// -----------------------------------------------------------------------------
-
-const nLayer = 1;
-const nEmbd = 16;
-const blockSize = 16;
-const nHead = 4;
-const headDim = nEmbd / nHead;
-
-if (!Number.isInteger(headDim)) {
-  throw new Error("nEmbd must be divisible by nHead");
-}
-
-// -----------------------------------------------------------------------------
 // Parameter initialization
 // -----------------------------------------------------------------------------
 
 type Matrix = Value[][];
 type StateDict = Record<string, Matrix>;
+
+// Populated by main(); gpt() reads it.
+let stateDict: StateDict;
 
 function matrix(
   nout: number,
@@ -269,51 +261,11 @@ function matrix(
   );
 }
 
-const stateDict: StateDict = {
-  wte: matrix(vocabSize, nEmbd),
-  wpe: matrix(blockSize, nEmbd),
-  lm_head: matrix(vocabSize, nEmbd),
-};
-
-for (let i = 0; i < nLayer; i++) {
-  stateDict[`layer${i}.attn_wq`] =
-    matrix(nEmbd, nEmbd);
-
-  stateDict[`layer${i}.attn_wk`] =
-    matrix(nEmbd, nEmbd);
-
-  stateDict[`layer${i}.attn_wv`] =
-    matrix(nEmbd, nEmbd);
-
-  stateDict[`layer${i}.attn_wo`] =
-    matrix(nEmbd, nEmbd);
-
-  stateDict[`layer${i}.mlp_fc1`] =
-    matrix(4 * nEmbd, nEmbd);
-
-  stateDict[`layer${i}.mlp_fc2`] =
-    matrix(nEmbd, 4 * nEmbd);
-}
-
-// Flatten parameters.
-
-const params: Value[] = [];
-
-for (const mat of Object.values(stateDict)) {
-  for (const row of mat) {
-    for (const p of row) {
-      params.push(p);
-    }
-  }
-}
-
-console.log(`num params: ${params.length}`);
-
 // -----------------------------------------------------------------------------
 // Math helpers
 // -----------------------------------------------------------------------------
 
-function sumValues(xs: Value[]): Value {
+export function sumValues(xs: Value[]): Value {
   if (xs.length === 0) {
     return new Value(0);
   }
@@ -324,7 +276,7 @@ function sumValues(xs: Value[]): Value {
   );
 }
 
-function linear(x: Value[], w: Matrix): Value[] {
+export function linear(x: Value[], w: Matrix): Value[] {
   return w.map((row) => {
     const terms = row.map((wi, i) =>
       wi.mul(x[i])
@@ -334,7 +286,7 @@ function linear(x: Value[], w: Matrix): Value[] {
   });
 }
 
-function softmax(logits: Value[]): Value[] {
+export function softmax(logits: Value[]): Value[] {
   const maxVal = Math.max(
     ...logits.map((x) => x.data)
   );
@@ -348,7 +300,7 @@ function softmax(logits: Value[]): Value[] {
   return exps.map((e) => e.div(total));
 }
 
-function rmsnorm(x: Value[]): Value[] {
+export function rmsnorm(x: Value[]): Value[] {
   const ms = sumValues(
     x.map((xi) => xi.mul(xi))
   ).div(x.length);
@@ -406,8 +358,6 @@ function gpt(
       stateDict[`layer${li}.attn_wv`]
     );
 
-    // keys[li].push(k as unknown as Value);
-    // values[li].push(v as unknown as Value);
     keys[li].push(k);
     values[li].push(v);
 
@@ -493,200 +443,274 @@ function gpt(
 }
 
 // -----------------------------------------------------------------------------
-// Adam
+// Training and inference
 // -----------------------------------------------------------------------------
 
-const learningRate = 0.01;
-const beta1 = 0.85;
-const beta2 = 0.99;
-const epsAdam = 1e-8;
+function main(): void {
+  // -------------------------------------------------------------------------
+  // Dataset
+  // -------------------------------------------------------------------------
 
-const m = new Array<number>(
-  params.length
-).fill(0);
+  let docs: string[];
 
-const v = new Array<number>(
-  params.length
-).fill(0);
-
-// -----------------------------------------------------------------------------
-// Training
-// -----------------------------------------------------------------------------
-
-// Read a positive integer from the environment, e.g. MICROGPT_STEPS=100.
-function envInt(name: string, fallback: number): number {
-  const raw = process.env[name];
-
-  if (raw === undefined) return fallback;
-
-  const value = Number(raw);
-
-  if (!Number.isInteger(value) || value <= 0) {
+  if (existsSync("input.txt")) {
+    docs = readFileSync("input.txt", "utf8")
+      .split(/\r?\n/)
+      .map((x) => x.trim())
+      .filter(Boolean);
+  } else {
     throw new Error(
-      `${name} must be a positive integer, got "${raw}"`
+      "input.txt not found. Download the names dataset and put it next to microgpt.ts."
     );
   }
 
-  return value;
-}
+  rng.shuffle(docs);
 
-const numSteps = envInt("MICROGPT_STEPS", 1000); // number of training steps
+  console.log(`num docs: ${docs.length}`);
 
-for (let step = 0; step < numSteps; step++) {
-  const doc = docs[step % docs.length];
+  // -------------------------------------------------------------------------
+  // Tokenizer
+  // -------------------------------------------------------------------------
 
-  const tokens = [
-    BOS,
-    ...[...doc].map((ch) => {
-      const token = charToToken.get(ch);
+  const uchars = [...new Set(docs.join(""))].sort();
+  const BOS = uchars.length;
+  const vocabSize = uchars.length + 1;
 
-      if (token === undefined) {
-        throw new Error(`Unknown character: ${ch}`);
+  console.log(`vocab size: ${vocabSize}`);
+
+  const charToToken = new Map<string, number>(
+    uchars.map((ch, i) => [ch, i])
+  );
+
+  // -------------------------------------------------------------------------
+  // Parameter initialization
+  // -------------------------------------------------------------------------
+
+  stateDict = {
+    wte: matrix(vocabSize, nEmbd),
+    wpe: matrix(blockSize, nEmbd),
+    lm_head: matrix(vocabSize, nEmbd),
+  };
+
+  for (let i = 0; i < nLayer; i++) {
+    stateDict[`layer${i}.attn_wq`] =
+      matrix(nEmbd, nEmbd);
+
+    stateDict[`layer${i}.attn_wk`] =
+      matrix(nEmbd, nEmbd);
+
+    stateDict[`layer${i}.attn_wv`] =
+      matrix(nEmbd, nEmbd);
+
+    stateDict[`layer${i}.attn_wo`] =
+      matrix(nEmbd, nEmbd);
+
+    stateDict[`layer${i}.mlp_fc1`] =
+      matrix(4 * nEmbd, nEmbd);
+
+    stateDict[`layer${i}.mlp_fc2`] =
+      matrix(nEmbd, 4 * nEmbd);
+  }
+
+  // Flatten parameters.
+
+  const params: Value[] = [];
+
+  for (const mat of Object.values(stateDict)) {
+    for (const row of mat) {
+      for (const p of row) {
+        params.push(p);
       }
-
-      return token;
-    }),
-    BOS,
-  ];
-
-  const n = Math.min(
-    blockSize,
-    tokens.length - 1
-  );
-
-  const keys: KVCache = Array.from(
-    { length: nLayer },
-    () => []
-  );
-
-  const values: KVCache = Array.from(
-    { length: nLayer },
-    () => []
-  );
-
-  const losses: Value[] = [];
-
-  for (let posId = 0; posId < n; posId++) {
-    const tokenId = tokens[posId];
-    const targetId = tokens[posId + 1];
-
-    const logits = gpt(
-      tokenId,
-      posId,
-      keys,
-      values
-    );
-
-    const probs = softmax(logits);
-
-    const lossT = probs[targetId].log().neg();
-
-    losses.push(lossT);
+    }
   }
 
-  const loss = sumValues(losses).div(n);
+  console.log(`num params: ${params.length}`);
 
-  // Backprop.
-  loss.backward();
+  // -------------------------------------------------------------------------
+  // Adam buffers
+  // -------------------------------------------------------------------------
 
-  // Adam.
-  const lrT =
-    learningRate *
-    (1 - step / numSteps);
+  const m = new Array<number>(
+    params.length
+  ).fill(0);
 
-  for (let i = 0; i < params.length; i++) {
-    const p = params[i];
+  const v = new Array<number>(
+    params.length
+  ).fill(0);
 
-    m[i] =
-      beta1 * m[i] +
-      (1 - beta1) * p.grad;
+  // -------------------------------------------------------------------------
+  // Training
+  // -------------------------------------------------------------------------
 
-    v[i] =
-      beta2 * v[i] +
-      (1 - beta2) * p.grad ** 2;
+  for (let step = 0; step < numSteps; step++) {
+    const doc = docs[step % docs.length];
 
-    const mHat =
-      m[i] /
-      (1 - beta1 ** (step + 1));
+    const tokens = [
+      BOS,
+      ...[...doc].map((ch) => {
+        const token = charToToken.get(ch);
 
-    const vHat =
-      v[i] /
-      (1 - beta2 ** (step + 1));
+        if (token === undefined) {
+          throw new Error(`Unknown character: ${ch}`);
+        }
 
-    p.data -=
-      lrT *
-      mHat /
-      (Math.sqrt(vHat) + epsAdam);
+        return token;
+      }),
+      BOS,
+    ];
 
-    // Reset gradient for next iteration.
-    p.grad = 0;
-  }
-
-  process.stdout.write(
-    `step ${(step + 1)
-      .toString()
-      .padStart(4)} / ${numSteps
-      .toString()
-      .padStart(4)} | loss ${loss.data.toFixed(4)}\r`
-  );
-}
-
-// -----------------------------------------------------------------------------
-// Inference
-// -----------------------------------------------------------------------------
-
-const temperature = 0.5;
-
-console.log(
-  "\n--- inference (new, hallucinated names) ---"
-);
-
-for (let sampleIdx = 0; sampleIdx < 20; sampleIdx++) {
-  const keys: KVCache = Array.from(
-    { length: nLayer },
-    () => []
-  );
-
-  const values: KVCache = Array.from(
-    { length: nLayer },
-    () => []
-  );
-
-  let tokenId = BOS;
-  const sample: string[] = [];
-
-  for (
-    let posId = 0;
-    posId < blockSize;
-    posId++
-  ) {
-    const logits = gpt(
-      tokenId,
-      posId,
-      keys,
-      values
+    const n = Math.min(
+      blockSize,
+      tokens.length - 1
     );
 
-    const probs = softmax(
-      logits.map((l) =>
-        l.div(temperature)
-      )
+    const keys: KVCache = Array.from(
+      { length: nLayer },
+      () => []
     );
 
-    tokenId = rng.choiceWeighted(
-      probs.map((p) => p.data)
+    const values: KVCache = Array.from(
+      { length: nLayer },
+      () => []
     );
 
-    if (tokenId === BOS) {
-      break;
+    const losses: Value[] = [];
+
+    for (let posId = 0; posId < n; posId++) {
+      const tokenId = tokens[posId];
+      const targetId = tokens[posId + 1];
+
+      const logits = gpt(
+        tokenId,
+        posId,
+        keys,
+        values
+      );
+
+      const probs = softmax(logits);
+
+      const lossT = probs[targetId].log().neg();
+
+      losses.push(lossT);
     }
 
-    sample.push(uchars[tokenId]);
+    const loss = sumValues(losses).div(n);
+
+    // Backprop.
+    loss.backward();
+
+    // Adam.
+    const lrT =
+      learningRate *
+      (1 - step / numSteps);
+
+    for (let i = 0; i < params.length; i++) {
+      const p = params[i];
+
+      m[i] =
+        beta1 * m[i] +
+        (1 - beta1) * p.grad;
+
+      v[i] =
+        beta2 * v[i] +
+        (1 - beta2) * p.grad ** 2;
+
+      const mHat =
+        m[i] /
+        (1 - beta1 ** (step + 1));
+
+      const vHat =
+        v[i] /
+        (1 - beta2 ** (step + 1));
+
+      p.data -=
+        lrT *
+        mHat /
+        (Math.sqrt(vHat) + epsAdam);
+
+      // Reset gradient for next iteration.
+      p.grad = 0;
+    }
+
+    process.stdout.write(
+      `step ${(step + 1)
+        .toString()
+        .padStart(4)} / ${numSteps
+        .toString()
+        .padStart(4)} | loss ${loss.data.toFixed(4)}\r`
+    );
   }
 
+  // -------------------------------------------------------------------------
+  // Inference
+  // -------------------------------------------------------------------------
+
+  const temperature = 0.5;
+
   console.log(
-    `sample ${(sampleIdx + 1)
-      .toString()
-      .padStart(2)}: ${sample.join("")}`
+    "\n--- inference (new, hallucinated names) ---"
   );
+
+  for (
+    let sampleIdx = 0;
+    sampleIdx < 20;
+    sampleIdx++
+  ) {
+    const keys: KVCache = Array.from(
+      { length: nLayer },
+      () => []
+    );
+
+    const values: KVCache = Array.from(
+      { length: nLayer },
+      () => []
+    );
+
+    let tokenId = BOS;
+    const sample: string[] = [];
+
+    for (
+      let posId = 0;
+      posId < blockSize;
+      posId++
+    ) {
+      const logits = gpt(
+        tokenId,
+        posId,
+        keys,
+        values
+      );
+
+      const probs = softmax(
+        logits.map((l) =>
+          l.div(temperature)
+        )
+      );
+
+      tokenId = rng.choiceWeighted(
+        probs.map((p) => p.data)
+      );
+
+      if (tokenId === BOS) {
+        break;
+      }
+
+      sample.push(uchars[tokenId]);
+    }
+
+    console.log(
+      `sample ${(sampleIdx + 1)
+        .toString()
+        .padStart(2)}: ${sample.join("")}`
+    );
+  }
+}
+
+// -----------------------------------------------------------------------------
+
+if (
+  process.argv[1] &&
+  import.meta.url === pathToFileURL(process.argv[1]).href
+) {
+  main();
 }
