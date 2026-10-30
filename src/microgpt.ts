@@ -53,6 +53,13 @@ class RNG {
 
   choiceWeighted(weights: number[]): number {
     const total = weights.reduce((a, b) => a + b, 0);
+
+    if (!Number.isFinite(total)) {
+      throw new Error(
+        `choiceWeighted: weights must sum to a finite number, got ${total}`
+      );
+    }
+
     let r = this.random() * total;
 
     for (let i = 0; i < weights.length; i++) {
@@ -245,6 +252,18 @@ type StateDict = Record<string, Matrix>;
 // Populated by main(); gpt() reads it.
 let stateDict: StateDict;
 
+// Fetch a parameter matrix by name. Fails loudly on a typo instead of
+// returning undefined and crashing later inside a .map().
+function param(key: string): Matrix {
+  const mat = stateDict[key];
+
+  if (!mat) {
+    throw new Error(`unknown parameter "${key}"`);
+  }
+
+  return mat;
+}
+
 function matrix(
   nout: number,
   nin: number,
@@ -324,8 +343,8 @@ function gpt(
   keys: KVCache,
   values: KVCache
 ): Value[] {
-  const tokEmb = stateDict.wte[tokenId];
-  const posEmb = stateDict.wpe[posId];
+  const tokEmb = param("wte")[tokenId];
+  const posEmb = param("wpe")[posId];
 
   let x = tokEmb.map((t, i) =>
     t.add(posEmb[i])
@@ -344,17 +363,17 @@ function gpt(
 
     const q = linear(
       x,
-      stateDict[`layer${li}.attn_wq`]
+      param(`layer${li}.attn_wq`)
     );
 
     const k = linear(
       x,
-      stateDict[`layer${li}.attn_wk`]
+      param(`layer${li}.attn_wk`)
     );
 
     const v = linear(
       x,
-      stateDict[`layer${li}.attn_wv`]
+      param(`layer${li}.attn_wv`)
     );
 
     keys[li].push(k);
@@ -403,7 +422,7 @@ function gpt(
 
     x = linear(
       xAttn,
-      stateDict[`layer${li}.attn_wo`]
+      param(`layer${li}.attn_wo`)
     );
 
     x = x.map((a, i) =>
@@ -420,14 +439,14 @@ function gpt(
 
     x = linear(
       x,
-      stateDict[`layer${li}.mlp_fc1`]
+      param(`layer${li}.mlp_fc1`)
     );
 
     x = x.map((xi) => xi.relu());
 
     x = linear(
       x,
-      stateDict[`layer${li}.mlp_fc2`]
+      param(`layer${li}.mlp_fc2`)
     );
 
     x = x.map((a, i) =>
@@ -437,7 +456,7 @@ function gpt(
 
   return linear(
     x,
-    stateDict.lm_head
+    param("lm_head")
   );
 }
 
@@ -609,6 +628,13 @@ function main(): void {
     }
 
     const loss = sumValues(losses).div(n);
+
+    if (!Number.isFinite(loss.data)) {
+      throw new Error(
+        `step ${step + 1}: loss is not finite (${loss.data}), ` +
+          "aborting before the update corrupts the weights"
+      );
+    }
 
     // Backprop.
     loss.backward();
